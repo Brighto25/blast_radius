@@ -37,6 +37,9 @@ DATA = os.environ.get("BR_DATA", "/data")
 MAP_PATH = os.environ.get("BR_MAP", os.path.join(APP, "map.json.gz"))
 LINES_PATH = os.environ.get("BR_LINES", os.path.join(os.path.dirname(MAP_PATH), "lines.json.gz"))
 LINE_FILTER = os.environ.get("BR_LINE_FILTER", "1") == "1"
+JOB_FILTER = os.environ.get("BR_JOB_FILTER", "1") == "1"
+JOB_SETUP = float(os.environ.get("BR_JOB_SETUP", "2.5"))  # class setup + building every job's arguments
+JOB_GAIN = float(os.environ.get("BR_JOB_GAIN", "0.5"))  # run a job subset when it costs under this share
 RUN_MAX = float(os.environ.get("BR_RUN_MAX", "5.0"))  # run candidates up to this many seconds
 PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
 PROXY = os.environ.get("BR_PROXY", "1") == "1"
@@ -564,6 +567,7 @@ def line_tests(f, lines, tests):
             num_by_id = {t["id"]: t["number"] for t in tests}
             _LINES["remap"] = [num_by_id.get(i) for i in raw["ids"]]
             _LINES["raw"] = raw["files"]
+            _LINES["jobs"] = {num_by_id[t]: v for t, v in raw.get("jobs", {}).items() if t in num_by_id}
         except Exception as e:
             log("line data unavailable", repr(e))
             _LINES["raw"] = None
@@ -590,6 +594,47 @@ def line_tests(f, lines, tests):
     return out
 
 
+_JOBS = {}
+
+
+def job_data(n, tests):
+    """Per-job line coverage of pool test n (each submit() is one job), or None."""
+    if "raw" not in _LINES:
+        line_tests("", (), tests)  # loads the file
+    raw = (_LINES.get("jobs") or {}).get(n)
+    if raw is None:
+        return None
+    if n not in _JOBS:
+        d = json.loads(raw)
+        sets = [frozenset(x) for x in d["s"]]
+        _JOBS[n] = {
+            "n": d["n"],
+            "none": set(d["none"]),
+            "t": d["t"],
+            "main": {f: set(v) for f, v in d["m"].items()},
+            "by": {f: {ln: sets[k] for ln, k in v} for f, v in d["l"].items()},
+        }
+    return _JOBS[n]
+
+
+def job_subset(n, an, tests):
+    """Jobs of pool test n that run a changed line; None when every job may be affected."""
+    jd = job_data(n, tests)
+    if jd is None or not jd["none"]:
+        return None  # a skipped job must look like one that returned None
+    J = set()
+    for f, lines in an.job_probe.items():
+        if not lines.isdisjoint(jd["main"].get(f, ())):
+            return None
+        by = jd["by"].get(f)
+        if by:
+            for ln in lines:
+                js = by.get(ln)
+                if js:
+                    J |= js
+    return J
+
+
 class Analysis:
     def __init__(self, cid, files, tests, mp):
         self.cid = cid
@@ -606,6 +651,11 @@ class Analysis:
         self.stop_on_fail = False
         self.attr_surgery = []
         self.proxy_heavy = set()
+        self.job_probe = {}  # file -> probed lines, when every change is a localised body edit
+        self.job_clean = 0
+        self.job_files = 0
+        self.job_filter = {}  # test -> jobs to run
+        self.deferred = []  # costly tests run (on a job subset) only once a cheap test fails
 
     def add(self, ts, why):
         before = len(self.cands)
@@ -849,6 +899,7 @@ def analyse_commit(cid, text, mp, tests):
         rel = new_rel or old_rel
         if rel is None:
             continue
+        an.job_files += 1
         if fd["binary"]:
             an.add(mp["opens"].get(rel, ()), "binary-open")
             an.add(mp["files"].get(rel, ()), "binary-file")
@@ -886,6 +937,7 @@ def analyse_commit(cid, text, mp, tests):
             res = analyse_py(old_text, new_text if not fd["deleted"] else None)
             kind = res["kind"]
             if kind == "same" and old_rel == new_rel:
+                an.job_clean += 1
                 continue
             if kind == "doc" and old_rel == new_rel and rel.startswith("sqlglot/"):
                 # only docstrings changed: they matter to doctests and to code reading __doc__
@@ -934,6 +986,18 @@ def analyse_commit(cid, text, mp, tests):
                     an.surgery.setdefault(f, set()).update(res["funcs"])
                 else:
                     an.full_reload = True
+                if (
+                    probe is not None
+                    and res.get("surgical", False)
+                    and f.startswith("sqlglot/")
+                    and not any(
+                        (f + "::" + q) in mp["import_units"]
+                        or any(u.startswith(f + "::" + q + ".") for u in mp["import_by_file"].get(f, ()))
+                        for q in res["funcs"]
+                    )
+                ):
+                    an.job_clean += 1
+                    an.job_probe.setdefault(f, set()).update(probe)
                 # executed at import time? surgery can't replay that
                 for q in res["funcs"]:
                     if (f + "::" + q) in mp["import_units"] or any(
@@ -1123,6 +1187,10 @@ class _PatchedFinder(importlib.abc.MetaPathFinder):
         return None
 
 
+_JOBF = {}  # test number -> jobs (submit indices) to run; the others return None
+_CUR = [None]  # test number running in this child
+
+
 class InlineExecutor:
     """Stand-in for the spawn ProcessPoolExecutor some tests use: spawned workers
     would import sqlglot from disk (unpatched) and cost a process start each."""
@@ -1132,6 +1200,8 @@ class InlineExecutor:
             import pickle
 
             initializer(*pickle.loads(pickle.dumps(initargs)))
+        self._k = 0
+        self._only = _JOBF.get(_CUR[0])
 
     def submit(self, fn, *a, **kw):
         import concurrent.futures as cf
@@ -1139,6 +1209,11 @@ class InlineExecutor:
         import pickle
 
         fut = cf.Future()
+        k = self._k
+        self._k += 1
+        if self._only is not None and k not in self._only:
+            fut.set_result(None)  # no changed line runs in this job
+            return fut
         try:
             # spawn workers receive pickled work and return pickled results
             fn, a, kw = pickle.loads(pickle.dumps((fn, a, kw)))
@@ -1426,19 +1501,7 @@ def child_main(an, run_ids, tests, wfd):
 
     import unittest
 
-    groups = []
-    gi = {}
-    for num in run_ids:
-        tid = tests[num]["id"]
-        parts = tid.split("::")
-        mod = _module_name(parts[0])
-        cls = parts[1] if len(parts) > 2 else None
-        meth = parts[-1]
-        key = (mod, cls)
-        if key not in gi:
-            gi[key] = len(groups)
-            groups.append((mod, cls, []))
-        groups[gi[key]][2].append((num, meth))
+    groups = _group_ids(run_ids, tests)
 
     signal.signal(signal.SIGALRM, _alarm)
 
@@ -1472,6 +1535,7 @@ def child_main(an, run_ids, tests, wfd):
 
         def startTest(self, test):
             n = self.nums_by_test.get(id(test))
+            _CUR[0] = n
             if n is not None:
                 sec = tests[n]["seconds"]
                 lim = max(1.5, sec * 3 + 1.0)
@@ -1482,13 +1546,50 @@ def child_main(an, run_ids, tests, wfd):
 
         def stopTest(self, test):
             signal.setitimer(signal.ITIMER_REAL, 0)
+            _CUR[0] = None
             super().stopTest(test)
             n = self.nums_by_test.get(id(test))
             if n is not None:
                 emit(n, n not in self.bad)
                 if an.stop_on_fail and n in self.bad:
-                    out.close()
-                    os._exit(0)
+                    if an.deferred and not deferred_done[0]:
+                        failed[0] = True
+                        self.shouldStop = True  # finish this class, then the deferred tests
+                    else:
+                        out.close()
+                        os._exit(0)
+
+    failed = [False]
+    deferred_done = [False]
+    _JOBF.update(an.job_filter)
+    run_groups(groups, R, tests, an, emit, failed)
+    if failed[0] and an.deferred:
+        deferred_done[0] = True
+        an.stop_on_fail = False
+        run_groups(_group_ids(an.deferred, tests), R, tests, an, emit, failed)
+    out.close()
+    os._exit(0)
+
+
+def _group_ids(run_ids, tests):
+    groups = []
+    gi = {}
+    for num in run_ids:
+        tid = tests[num]["id"]
+        parts = tid.split("::")
+        mod = _module_name(parts[0])
+        cls = parts[1] if len(parts) > 2 else None
+        meth = parts[-1]
+        key = (mod, cls)
+        if key not in gi:
+            gi[key] = len(groups)
+            groups.append((mod, cls, []))
+        groups[gi[key]][2].append((num, meth))
+    return groups
+
+
+def run_groups(groups, R, tests, an, emit, failed):
+    import unittest
 
     for mod, cls, items in groups:
         try:
@@ -1507,6 +1608,9 @@ def child_main(an, run_ids, tests, wfd):
             signal.setitimer(signal.ITIMER_REAL, 0)
             for num, _ in items:
                 emit(num, False)
+            failed[0] = True
+            if an.stop_on_fail and an.deferred:
+                return
             continue
         r = R(nums)
         try:
@@ -1516,14 +1620,17 @@ def child_main(an, run_ids, tests, wfd):
         if r.holder_error:  # setUpClass / module fixture failed
             for num, _ in items:
                 emit(num, False)
+            failed[0] = True
             if an.stop_on_fail:
-                break
+                return
         else:
             for num, _ in items:
                 if num in r.bad:
                     emit(num, False)
-    out.close()
-    os._exit(0)
+            if r.bad:
+                failed[0] = True
+        if failed[0] and an.stop_on_fail:
+            return
 
 
 # ----------------------------------------------------------------------------
@@ -1577,6 +1684,44 @@ def choose_runs(cands, tests, force_run=False):
             best = (cost, k)
     k = best[1]
     return sorted(runnable[:k]), cands.difference(runnable[:k])
+
+
+def apply_job_filter(an, run, blind, tests):
+    """Pool tests whose changed lines only some jobs reach run just those jobs.
+    A test none of whose jobs runs a changed line is dropped; one selected unrun
+    (blind) runs its subset when that is cheap; one stood in for by cheap tests
+    (proxy_heavy) runs its subset only after a cheap test fails (deferred)."""
+    if not (JOB_FILTER and an.job_probe and an.job_clean == an.job_files and not an.full_reload and not an.unknown):
+        return run, blind
+    run = list(run)
+    blind = set(blind)
+    for n in sorted(an.cands):
+        J = job_subset(n, an, tests)
+        if J is None:
+            continue
+        jd = job_data(n, tests)
+        tot = sum(jd["t"]) or 1.0
+        est = JOB_SETUP + cpu_of(n, tests) * sum(jd["t"][k] for k in J if k < len(jd["t"])) / tot
+        where = "run" if n in run else "blind" if n in blind else "proxy" if n in an.proxy_heavy else "?"
+        if DEBUG:
+            an.reasons.append(f"jobs:{n}:{where}:{len(J)}/{jd['n']}:est={est:.1f}")
+        if not J:
+            if n in run:
+                run.remove(n)
+            blind.discard(n)
+            an.proxy_heavy.discard(n)
+            an.cands.discard(n)
+            continue
+        if n in run:
+            an.job_filter[n] = J
+        elif n in blind and est * CPU_FACTOR < tests[n]["seconds"] * JOB_GAIN:
+            blind.discard(n)
+            run.insert(0, n)
+            an.job_filter[n] = J
+        elif n in an.proxy_heavy and an.stop_on_fail and est < tests[n]["seconds"] * JOB_GAIN:
+            an.deferred.append(n)
+            an.job_filter[n] = J
+    return run, blind
 
 
 def pack(nums, tests):
@@ -1685,6 +1830,7 @@ def main():
                     blind = set()
                     run = sorted(run, key=lambda n: cpu_of(n, tests))
                     an.stop_on_fail = True
+            run, blind = apply_job_filter(an, run, blind, tests)
             plans.append((an, run, blind))
             if DEBUG:
                 log(cid, f"cands={len(cands)} run={len(run)} blind={len(blind)} reload={an.full_reload}", [r for r in an.reasons if not r.endswith(":+0")])
@@ -1767,7 +1913,7 @@ def run_plans(plans, tests, results):
             finally:
                 os._exit(4)
         os.close(wfd)
-        total = sum(tests[n]["seconds"] for n in run)
+        total = sum(tests[n]["seconds"] for n in list(run) + list(an.deferred))
         deadline = time.time() + 10 + 4 * total
         active[rfd] = {"an": an, "run": run, "blind": blind, "pid": pid, "buf": b"", "done": {}, "deadline": deadline}
 
@@ -1803,7 +1949,8 @@ def run_plans(plans, tests, results):
             if not st["done"].get(n, False):  # failed, or never reported
                 sel.add(n)
         if st["an"].proxy_heavy and (sel - set(st["blind"]) or killed or status):
-            sel |= st["an"].proxy_heavy
+            # a deferred test that ran (on its job subset) and passed is not needed
+            sel |= {n for n in st["an"].proxy_heavy if not st["done"].get(n, False)}
         results[st["an"].cid] = sel
         if DEBUG or killed or status:
             log(st["an"].cid, f"ran={len(st['done'])}/{len(st['run'])} sel={len(sel)} cpu={cpu:.2f} est={sum(tests[n]['seconds'] for n in st['run']):.2f} ecpu={sum(cpu_of(n, tests) for n in st['run']):.2f} killed={killed} status={status}")

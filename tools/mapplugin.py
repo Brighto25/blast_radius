@@ -103,12 +103,67 @@ def _on_line_all(code, line):
     if f.startswith(LIB):
         pl = _phase_lines[0]
         if pl is not None:
+            if _importing[0] and _job[0] is not None:
+                pl = _job[0]["main"]  # import-time work is shared by every job
             pl.add((f[len(ROOT):], line))
     return mon.DISABLE
 
 
+_importing = [0]
+import importlib._bootstrap as _ib
+
+_orig_fal = _ib._find_and_load
+
+
+def _find_and_load(*a, **kw):
+    _importing[0] += 1
+    try:
+        return _orig_fal(*a, **kw)
+    finally:
+        _importing[0] -= 1
+
+
+if os.environ.get("JOB_TESTS"):
+    _ib._find_and_load = _find_and_load
+
+
+# JOB_TESTS: per-job windows inside these tests' call phase (pool work items), so
+# the selector can run only the work items a change can reach.
+JOB_TESTS = set(filter(None, os.environ.get("JOB_TESTS", "").split(",")))
+_job = [None]  # {"main": set, "jobs": [set], "none": set, "t": [secs], "cur": idx|None, "t0": float}
+
+
+def _job_switch(k):
+    """Attribute the lines run from now on to job k (None = the test's own code)."""
+    import time
+
+    js = _job[0]
+    if js is None:
+        return
+    now = time.process_time()
+    if js["cur"] is not None:
+        js["t"][js["cur"]] += now - js["t0"]
+    js["t0"] = now
+    js["cur"] = k
+    if k is None:
+        _phase_lines[0] = js["main"]
+    else:
+        while len(js["jobs"]) <= k:
+            js["jobs"].append(set())
+            js["t"].append(0.0)
+        _phase_lines[0] = js["jobs"][k]
+    mon.restart_events()
+
+
 def _flush_phase():
     pl = _phase_lines[0]
+    js = _job[0]
+    if js is not None:
+        _job_switch(None)
+        _job[0] = None
+        pl = set(js["main"])
+        for s in js["jobs"]:
+            pl |= s
     if pl is None:
         return
     _phase_lines[0] = None
@@ -120,7 +175,23 @@ def _flush_phase():
     byf = {}
     for f, ln in pl:
         byf.setdefault(f, []).append(ln)
-    _lines_out[0].write(json.dumps({"c": _ctx[0], "l": {f: sorted(v) for f, v in byf.items()}}) + chr(10))
+    rec = {"c": _ctx[0], "l": {f: sorted(v) for f, v in byf.items()}}
+    if js is not None:
+
+        def by_file(ss):
+            d = {}
+            for f, ln in ss:
+                d.setdefault(f, []).append(ln)
+            return {f: sorted(v) for f, v in d.items()}
+
+        rec["j"] = {
+            "main": by_file(js["main"]),
+            "jobs": [by_file(x) for x in js["jobs"]],
+            "none": sorted(js["none"]),
+            "n": js["n"],
+            "t": [round(x, 4) for x in js["t"]],
+        }
+    _lines_out[0].write(json.dumps(rec) + chr(10))
 
 
 def _on_line(code, line):
@@ -156,6 +227,8 @@ def _set(ctx):
     if ALL_LINES:
         if kind in ("setup", "call", "teardown"):
             _phase_lines[0] = set()
+            if kind == "call" and nid in JOB_TESTS:
+                _job[0] = {"main": _phase_lines[0], "jobs": [], "none": set(), "t": [], "cur": None, "t0": 0.0, "n": 0}
             mon.set_events(TOOL, mon.events.PY_START | mon.events.LINE)
         else:
             mon.set_events(TOOL, mon.events.PY_START)
@@ -212,29 +285,57 @@ class InlineExecutor:
             import pickle
 
             initializer(*pickle.loads(pickle.dumps(initargs)))
+        self._k = 0
+        self._jobs = _job[0] is not None and _job[0]["n"] == 0
+        if self._jobs:
+            _job_switch(0)  # the caller builds job 0's arguments next
 
     def submit(self, fn, *a, **kw):
         import concurrent.futures as cf
 
         import pickle
 
-        fut = cf.Future()
+        k = self._k
+        self._k += 1
+        fut = _JobFuture(k if self._jobs else None)
         try:
             # spawn workers receive pickled work and return pickled results
             fn, a, kw = pickle.loads(pickle.dumps((fn, a, kw)))
-            fut.set_result(pickle.loads(pickle.dumps(fn(*a, **kw))))
+            res = fn(*a, **kw)
+            if self._jobs and res is None:
+                _job[0]["none"].add(k)
+            fut.set_result(pickle.loads(pickle.dumps(res)))
         except BaseException as e:
             fut.set_exception(e)
+        if self._jobs:
+            _job[0]["n"] = self._k
+            _job_switch(k + 1)  # next job's arguments
         return fut
 
     def shutdown(self, *a, **kw):
-        pass
+        if self._jobs:
+            _job_switch(None)
 
     def __enter__(self):
         return self
 
     def __exit__(self, *a):
+        self.shutdown()
         return False
+
+
+import concurrent.futures as _cf
+
+
+class _JobFuture(_cf.Future):
+    def __init__(self, k):
+        super().__init__()
+        self._job_k = k
+
+    def result(self, timeout=None):
+        if self._job_k is not None:
+            _job_switch(self._job_k)  # what the caller does with this result counts to the job
+        return super().result(timeout)
 
 
 _spawns = set()
