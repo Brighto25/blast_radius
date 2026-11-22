@@ -38,6 +38,9 @@ MAP_PATH = os.environ.get("BR_MAP", os.path.join(APP, "map.json.gz"))
 LINES_PATH = os.environ.get("BR_LINES", os.path.join(os.path.dirname(MAP_PATH), "lines.json.gz"))
 LINE_FILTER = os.environ.get("BR_LINE_FILTER", "1") == "1"
 JOB_FILTER = os.environ.get("BR_JOB_FILTER", "1") == "1"
+# the parser node-limit stress test, when stood in for, is checked at a smaller width
+# (node limit scaled by the same ratio) after a cheap test fails
+SCALED = os.environ.get("BR_SCALED", "1") == "1"
 JOB_SETUP = float(os.environ.get("BR_JOB_SETUP", "2.5"))  # class setup + building every job's arguments
 JOB_GAIN = float(os.environ.get("BR_JOB_GAIN", "0.5"))  # run a job subset when it costs under this share
 RUN_MAX = float(os.environ.get("BR_RUN_MAX", "5.0"))  # run candidates up to this many seconds
@@ -660,6 +663,7 @@ class Analysis:
         self.job_files = 0
         self.job_filter = {}  # test -> jobs to run
         self.deferred = []  # costly tests run (on a job subset) only once a cheap test fails
+        self.scaled = set()  # deferred tests that run at a reduced size
         self.mode = "code"  # what the file being analysed is: "code" (.py) or "data"
         self.code_cands = set()  # candidates because of python edits
         self.data_tests = set()  # candidates because of data/fixture edits
@@ -1691,6 +1695,9 @@ def run_groups(groups, R, tests, an, emit, failed):
             signal.setitimer(signal.ITIMER_REAL, 0)
             _patch_pools()
             C = getattr(m, cls) if cls else None
+            for num, meth in items:
+                if num in an.scaled:
+                    _install_scaled(C, meth)
             cases = []
             nums = {}
             for num, meth in items:
@@ -1777,6 +1784,45 @@ def choose_runs(cands, tests, force_run=False):
             best = (cost, k)
     k = best[1]
     return sorted(runnable[:k]), cands.difference(runnable[:k])
+
+
+_SCALED_ID = "tests/test_parser.py::TestParser::test_max_nodes"
+_SCALE_W = 600  # of 10000 units
+
+
+def apply_scaled(an, run, tests):
+    """A stood-in node-limit test runs first, at a smaller width (its limit scaled by the
+    same ratio): no cheap test may cover what it checks. Its own result decides it.
+    Never when the test file itself changes."""
+    if not (SCALED and an.stop_on_fail and an.proxy_heavy and not an.unknown):
+        return run
+    touched = {r for fd in an.files for r in (fd["old"], fd["new"]) if r}
+    if "tests/test_parser.py" in touched:
+        return run
+    for n in sorted(an.proxy_heavy):
+        if tests[n]["id"] == _SCALED_ID and n not in an.deferred and n not in run:
+            run = [n] + list(run)
+            an.scaled.add(n)
+            if DEBUG:
+                an.reasons.append(f"scaled:{n}")
+    return run
+
+
+def _install_scaled(C, meth):
+    import inspect
+    import textwrap
+
+    src = textwrap.dedent(inspect.getsource(getattr(C, meth)))
+    a = "width = 10000"
+    b = "with self.assertRaises(ParseError) as ctx:\n        parse_one(sql, max_nodes=1_000_000)"
+    if src.count(a) != 1 or src.count(b) != 1:
+        raise RuntimeError("scaled test changed")  # the test then fails here: selected
+    lim = 1_000_000 * _SCALE_W // 10000
+    src = src.replace(a, "width = %d" % _SCALE_W).replace(b, b.replace("1_000_000", "%d" % lim))
+    mod = sys.modules[C.__module__]
+    ns = {}
+    exec(compile(src, mod.__file__, "exec"), vars(mod), ns)
+    setattr(C, meth, ns[meth])
 
 
 def apply_job_filter(an, run, blind, tests):
@@ -1944,6 +1990,7 @@ def main():
                 blind = (set(blind) - data_part) | b1 | b2
                 an.proxy_heavy -= data_part
             run, blind = apply_job_filter(an, run, blind, tests)
+            run = apply_scaled(an, run, tests)
             plans.append((an, run, blind))
             if DEBUG:
                 log(cid, f"cands={len(cands)} run={len(run)} blind={len(blind)} reload={an.full_reload}", [r for r in an.reasons if not r.endswith(":+0")])
