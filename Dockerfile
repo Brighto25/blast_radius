@@ -15,7 +15,7 @@ d=urllib.request.urlopen('https://github.com/tobymao/sqlglot/archive/eb11aec4be8
 tarfile.open(fileobj=io.BytesIO(d)).extractall('/app', filter='tar')" \
  && mv /app/sqlglot-eb11aec4be8cb2122afe713a4816662c3f0fb2fa /app/sqlglot
 
-COPY selector.py map.json.gz /app/
+COPY selector.py map.json.gz lines.json.gz /app/
 
 # The run's disk is read-only: precompile so imports never recompile.
 RUN (python -m compileall -q /app/sqlglot /app/selector.py || true) \

@@ -35,12 +35,15 @@ APP = os.environ.get("BR_APP", "/app")
 REPO = os.path.abspath(os.environ.get("BR_REPO", os.path.join(APP, "sqlglot")))
 DATA = os.environ.get("BR_DATA", "/data")
 MAP_PATH = os.environ.get("BR_MAP", os.path.join(APP, "map.json.gz"))
+LINES_PATH = os.environ.get("BR_LINES", os.path.join(os.path.dirname(MAP_PATH), "lines.json.gz"))
+LINE_FILTER = os.environ.get("BR_LINE_FILTER", "1") == "1"
 RUN_MAX = float(os.environ.get("BR_RUN_MAX", "5.0"))  # run candidates up to this many seconds
 PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
 PROXY = os.environ.get("BR_PROXY", "1") == "1"
 PROXY_BUDGET = float(os.environ.get("BR_PROXY_BUDGET", "1.5"))
 PROXY_ALL = int(os.environ.get("BR_PROXY_ALL", "2"))  # 1: code edits, 2: also re-import cases
 PROXY_MIN = int(os.environ.get("BR_PROXY_MIN", "3"))
+PROXY_CHEAP = float(os.environ.get("BR_PROXY_CHEAP", "0.25"))  # CPU s: cheaper candidates always run
 FIXTURE_FILTER = os.environ.get("BR_FIXTURE_FILTER", "1") == "1"
 FILTER_CAP = float(os.environ.get("BR_FILTER_CAP", "4"))  # per-test seconds when fixtures are filtered
 WORKER_MS = 2000
@@ -503,15 +506,20 @@ def probe_lines(old_src, hunks):
     changed, inserts = set(), set()
     for os_, ol, ns, nl, body in hunks:
         j = os_ if ol > 0 else os_ + 1
+        prev = " "
         for b in body:
             tag = b[:1]
             if tag == "-":
                 changed.add(j)
                 j += 1
             elif tag == "+":
-                inserts.add(j)
+                if prev != "-" and prev != "r":
+                    inserts.add(j)  # pure insertion: no removed line it replaces
+                else:
+                    tag = "r"  # replacement of the removed lines just above
             else:
                 j += 1
+            prev = tag
     ranges = _stmt_ranges(tree)
 
     def own(line):
@@ -535,7 +543,51 @@ def probe_lines(old_src, hunks):
             r = own(ln)
             if r is not None:
                 probe.update(range(r[0], r[1] + 1))
+            # code added after a loop/if body runs whenever its enclosing headers do
+            for lo, hi, full in ranges:
+                if full[0] <= ln <= full[1]:
+                    probe.update(range(lo, hi + 1))
     return probe
+
+
+_LINES = {}
+
+
+def line_tests(f, lines, tests):
+    """Tests (numbers) that executed any of these lines of f at the pinned commit; None if unknown."""
+    if not LINE_FILTER:
+        return None
+    if "raw" not in _LINES:
+        try:
+            with gzip.open(LINES_PATH, "rt") as fh:
+                raw = json.load(fh)
+            num_by_id = {t["id"]: t["number"] for t in tests}
+            _LINES["remap"] = [num_by_id.get(i) for i in raw["ids"]]
+            _LINES["raw"] = raw["files"]
+        except Exception as e:
+            log("line data unavailable", repr(e))
+            _LINES["raw"] = None
+    raw = _LINES["raw"]
+    if raw is None:
+        return None
+    if f not in _LINES:
+        s = raw.get(f)
+        if s is None:
+            _LINES[f] = None
+        else:
+            d = json.loads(s)
+            remap = _LINES["remap"]
+            sets = [frozenset(remap[i] for i in st if remap[i] is not None) for st in d["s"]]
+            _LINES[f] = {ln: sets[k] for ln, k in d["l"]}
+    byline = _LINES[f]
+    if byline is None:
+        return set()  # no test executed any line of f
+    out = set()
+    for ln in lines:
+        ts = byline.get(ln)
+        if ts:
+            out |= ts
+    return out
 
 
 class Analysis:
@@ -849,6 +901,16 @@ def analyse_commit(cid, text, mp, tests):
                 heavy_lines = mp["heavy_lines"]
                 for q in res["funcs"]:
                     ts = tests_of_unit_prefix(mp, f, q)
+                    at_import = (f + "::" + q) in mp["import_units"] or any(
+                        u.startswith(f + "::" + q + ".") for u in mp["import_by_file"].get(f, ())
+                    )
+                    if probe is not None and not at_import and f.startswith("sqlglot/"):
+                        hit = line_tests(f, probe, tests)
+                        if hit is not None:
+                            keep = (ts & hit) | (ts & mp["spawn_tests"])
+                            if DEBUG and len(keep) != len(ts):
+                                an.reasons.append(f"lines:-{len(ts) - len(keep)}")
+                            ts = keep
                     if probe is not None:
                         keep = set()
                         for t in ts:
@@ -1615,7 +1677,11 @@ def main():
                     run.append(n)
                     spent += cpu_of(n, tests)
                 if len(run) >= PROXY_MIN or (run and len(run) == len([n for n in cands if tests[n]["seconds"] <= RUN_MAX])):
-                    an.proxy_heavy |= set(blind) - set(run)
+                    rest = set(blind) - set(run)
+                    # only tests costly to run may be stood in for; cheap ones run themselves
+                    cheap = {n for n in rest if cpu_of(n, tests) <= PROXY_CHEAP and tests[n]["seconds"] <= RUN_MAX}
+                    run = run + sorted(cheap - set(run))
+                    an.proxy_heavy |= rest - cheap
                     blind = set()
                     run = sorted(run, key=lambda n: cpu_of(n, tests))
                     an.stop_on_fail = True

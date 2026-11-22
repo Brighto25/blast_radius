@@ -90,6 +90,39 @@ if os.environ.get("FLAG_LINES"):
 _flag_hits = {}  # nodeid -> set("file:line")
 
 
+ALL_LINES = os.environ.get("ALL_LINES") == "1"
+LIB = ROOT + "sqlglot" + os.sep
+_phase_lines = [None]  # ALL_LINES: lines of the current test phase
+_lines_out = [None]
+
+
+def _on_line_all(code, line):
+    f = code.co_filename
+    if not os.path.isabs(f):
+        f = os.path.abspath(f)
+    if f.startswith(LIB):
+        pl = _phase_lines[0]
+        if pl is not None:
+            pl.add((f[len(ROOT):], line))
+    return mon.DISABLE
+
+
+def _flush_phase():
+    pl = _phase_lines[0]
+    if pl is None:
+        return
+    _phase_lines[0] = None
+    if _lines_out[0] is None:
+        out = os.environ.get("MAPOUT")
+        os.makedirs(out, exist_ok=True)
+        wid = os.environ.get("PYTEST_XDIST_WORKER", "main")
+        _lines_out[0] = _orig_open(os.path.join(out, f"lines-{wid}.jsonl"), "w")
+    byf = {}
+    for f, ln in pl:
+        byf.setdefault(f, []).append(ln)
+    _lines_out[0].write(json.dumps({"c": _ctx[0], "l": {f: sorted(v) for f, v in byf.items()}}) + chr(10))
+
+
 def _on_line(code, line):
     tgt = _line_target[0]
     if tgt is None and FLAGL:
@@ -112,12 +145,22 @@ def _on_line(code, line):
     return mon.DISABLE
 
 
-mon.register_callback(TOOL, mon.events.LINE, _on_line)
+mon.register_callback(TOOL, mon.events.LINE, _on_line_all if ALL_LINES else _on_line)
 
 
 def _set(ctx):
+    if ALL_LINES:
+        _flush_phase()
     _ctx[0] = ctx
     kind, _, nid = ctx.partition("|")
+    if ALL_LINES:
+        if kind in ("setup", "call", "teardown"):
+            _phase_lines[0] = set()
+            mon.set_events(TOOL, mon.events.PY_START | mon.events.LINE)
+        else:
+            mon.set_events(TOOL, mon.events.PY_START)
+        mon.restart_events()
+        return
     if nid in HEAVY and kind in ("setup", "call", "teardown"):
         _line_target[0] = _lines.setdefault(nid, set())
         mon.set_events(TOOL, mon.events.PY_START | mon.events.LINE)
@@ -220,6 +263,8 @@ def pytest_runtest_logreport(report):
 
 
 def pytest_sessionfinish(session):
+    if _lines_out[0] is not None:
+        _lines_out[0].close()
     out = os.environ.get("MAPOUT")
     if not out:
         return
