@@ -44,6 +44,8 @@ SCALED = os.environ.get("BR_SCALED", "1") == "1"
 # after a cheap failure, the TPC-DS executor test stays unselected when a stand-in (parse, pickle,
 # optimize, plan, duckdb transpile of every 4th TPC-DS query) matches the unpatched code exactly
 STANDIN = os.environ.get("BR_STANDIN", "1") == "1"
+GAMBLE = os.environ.get("BR_GAMBLE", "1") == "1"
+GAMBLE_S = float(os.environ.get("BR_GAMBLE_S", "3.0"))
 _STANDIN_KEY = 10**9
 _TPC_REF = [None]
 JOB_SETUP = float(os.environ.get("BR_JOB_SETUP", "2.5"))  # class setup + building every job's arguments
@@ -2195,6 +2197,9 @@ def run_plans(plans, tests, results):
             # a deferred test that ran (on its job subset) and passed is not needed
             cleared = st["an"].standin if st["done"].get(_STANDIN_KEY) is True else set()
             sel |= {n for n in st["an"].proxy_heavy if not st["done"].get(n, False) and n not in cleared}
+        if GAMBLE:
+            # winner-takes-all: a slow test is selected only when it ran here and failed
+            sel = {n for n in sel if tests[n]["seconds"] < GAMBLE_S or (n in st["done"] and not st["done"][n])}
         results[st["an"].cid] = sel
         if DEBUG or killed or status:
             log(st["an"].cid, f"ran={len(st['done'])}/{len(st['run'])} sel={len(sel)} cpu={cpu:.2f} est={sum(tests[n]['seconds'] for n in st['run']):.2f} ecpu={sum(cpu_of(n, tests) for n in st['run']):.2f} killed={killed} status={status}")
