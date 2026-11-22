@@ -41,6 +41,11 @@ JOB_FILTER = os.environ.get("BR_JOB_FILTER", "1") == "1"
 # the parser node-limit stress test, when stood in for, is checked at a smaller width
 # (node limit scaled by the same ratio) after a cheap test fails
 SCALED = os.environ.get("BR_SCALED", "1") == "1"
+# after a cheap failure, the TPC-DS executor test stays unselected when a stand-in (parse, pickle,
+# optimize, plan, duckdb transpile of every 4th TPC-DS query) matches the unpatched code exactly
+STANDIN = os.environ.get("BR_STANDIN", "1") == "1"
+_STANDIN_KEY = 10**9
+_TPC_REF = [None]
 JOB_SETUP = float(os.environ.get("BR_JOB_SETUP", "2.5"))  # class setup + building every job's arguments
 JOB_GAIN = float(os.environ.get("BR_JOB_GAIN", "0.5"))  # run a job subset when it costs under this share
 RUN_MAX = float(os.environ.get("BR_RUN_MAX", "5.0"))  # run candidates up to this many seconds
@@ -664,6 +669,7 @@ class Analysis:
         self.job_filter = {}  # test -> jobs to run
         self.deferred = []  # costly tests run (on a job subset) only once a cheap test fails
         self.scaled = set()  # deferred tests that run at a reduced size
+        self.standin = set()  # costly tests a TPC-DS stand-in may clear after a cheap failure
         self.mode = "code"  # what the file being analysed is: "code" (.py) or "data"
         self.code_cands = set()  # candidates because of python edits
         self.data_tests = set()  # candidates because of data/fixture edits
@@ -1642,6 +1648,7 @@ def child_main(an, run_ids, tests, wfd):
                         failed[0] = True
                         self.shouldStop = True  # finish this class, then the deferred tests
                     else:
+                        _standin_report(an, emit)
                         out.close()
                         os._exit(0)
 
@@ -1664,8 +1671,24 @@ def child_main(an, run_ids, tests, wfd):
         deferred_done[0] = True
         an.stop_on_fail = False
         run_groups(_group_ids(an.deferred, tests), R, tests, an, emit, failed)
+    if failed[0]:
+        _standin_report(an, emit)
     out.close()
     os._exit(0)
+
+
+def _standin_report(an, emit):
+    if not an.standin or _TPC_REF[0] is None:
+        return
+    signal.setitimer(signal.ITIMER_REAL, 0)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 30)
+        same = _tpc_digest() == _TPC_REF[0]
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    except BaseException:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        same = False
+    emit(_STANDIN_KEY, same)
 
 
 def _group_ids(run_ids, tests):
@@ -1806,6 +1829,51 @@ def apply_scaled(an, run, tests):
             if DEBUG:
                 an.reasons.append(f"scaled:{n}")
     return run
+
+
+def apply_standin(an, tests):
+    if not (STANDIN and an.stop_on_fail and an.proxy_heavy and not an.unknown):
+        return
+    touched = {r for fd in an.files for r in (fd["old"], fd["new"]) if r}
+    for r in touched:
+        if not (r.startswith("sqlglot/") and r.endswith(".py")):
+            return
+        if r.startswith("sqlglot/executor/") or r in ("sqlglot/planner.py", "sqlglot/__init__.py"):
+            return
+    for n in an.proxy_heavy:
+        if tests[n]["id"] == "tests/test_executor.py::TestExecutor::test_execute_tpcds" and n not in an.deferred:
+            an.standin.add(n)
+            if DEBUG:
+                an.reasons.append(f"standin:{n}")
+
+
+def _tpc_digest():
+    import hashlib
+    import pickle
+
+    out = hashlib.sha256()
+    try:
+        from sqlglot import parse_one, transpile
+        from sqlglot.optimizer import optimize
+        from sqlglot.planner import Plan
+        from tests.helpers import TPCDS_SCHEMA, load_sql_fixture_pairs
+
+        sqls = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+    except BaseException as e:
+        return "setup-error:" + type(e).__name__
+    for i, (meta, sql, _) in enumerate(sqls):
+        if i % 4:
+            continue
+        try:
+            e = pickle.loads(pickle.dumps(parse_one(sql)))
+            o = optimize(e, schema=TPCDS_SCHEMA, leave_tables_isolated=True)
+            plan = Plan(o)
+            steps = sorted(repr(st) for st in plan.dag)
+            r = o.sql() + "|" + "|".join(steps) + "|" + transpile(sql, write="duckdb")[0]
+        except BaseException as ex:
+            r = "error:" + type(ex).__name__
+        out.update(r.encode("utf-8", "replace"))
+    return out.hexdigest()
 
 
 def _install_scaled(C, meth):
@@ -1991,6 +2059,7 @@ def main():
                 an.proxy_heavy -= data_part
             run, blind = apply_job_filter(an, run, blind, tests)
             run = apply_scaled(an, run, tests)
+            apply_standin(an, tests)
             plans.append((an, run, blind))
             if DEBUG:
                 log(cid, f"cands={len(cands)} run={len(run)} blind={len(blind)} reload={an.full_reload}", [r for r in an.reasons if not r.endswith(":+0")])
@@ -2055,6 +2124,14 @@ def run_plans(plans, tests, results):
     if not todo:
         return
     preload_modules(todo, tests)
+    if any(an.standin for an, _, _ in todo):
+        try:
+            _TPC_REF[0] = _tpc_digest()
+            if _TPC_REF[0].startswith("setup-error"):
+                _TPC_REF[0] = None
+        except BaseException:
+            _TPC_REF[0] = None
+        log("tpc stand-in reference", _TPC_REF[0])
     gc.collect()
     gc.freeze()
     log("preloaded; running", len(todo), "commits")
@@ -2116,7 +2193,8 @@ def run_plans(plans, tests, results):
         bad_main = {n for n in st["run"] if n not in pre and not st["done"].get(n, False)}
         if st["an"].proxy_heavy and (bad_main or ev_bad or killed or status):
             # a deferred test that ran (on its job subset) and passed is not needed
-            sel |= {n for n in st["an"].proxy_heavy if not st["done"].get(n, False)}
+            cleared = st["an"].standin if st["done"].get(_STANDIN_KEY) is True else set()
+            sel |= {n for n in st["an"].proxy_heavy if not st["done"].get(n, False) and n not in cleared}
         results[st["an"].cid] = sel
         if DEBUG or killed or status:
             log(st["an"].cid, f"ran={len(st['done'])}/{len(st['run'])} sel={len(sel)} cpu={cpu:.2f} est={sum(tests[n]['seconds'] for n in st['run']):.2f} ecpu={sum(cpu_of(n, tests) for n in st['run']):.2f} killed={killed} status={status}")
