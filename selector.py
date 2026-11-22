@@ -48,6 +48,7 @@ PROXY_ALL = int(os.environ.get("BR_PROXY_ALL", "2"))  # 1: code edits, 2: also r
 PROXY_MIN = int(os.environ.get("BR_PROXY_MIN", "3"))
 PROXY_CHEAP = float(os.environ.get("BR_PROXY_CHEAP", "0.25"))  # CPU s: cheaper candidates always run
 FIXTURE_FILTER = os.environ.get("BR_FIXTURE_FILTER", "1") == "1"
+MULTI_SPLIT = os.environ.get("BR_MULTI_SPLIT", "1") == "1"  # code + data commits: plan the code part on its own
 FILTER_CAP = float(os.environ.get("BR_FILTER_CAP", "4"))  # per-test seconds when fixtures are filtered
 WORKER_MS = 2000
 DEBUG = os.environ.get("BR_DEBUG") == "1"
@@ -656,10 +657,18 @@ class Analysis:
         self.job_files = 0
         self.job_filter = {}  # test -> jobs to run
         self.deferred = []  # costly tests run (on a job subset) only once a cheap test fails
+        self.mode = "code"  # what the file being analysed is: "code" (.py) or "data"
+        self.code_cands = set()  # candidates because of python edits
+        self.data_tests = set()  # candidates because of data/fixture edits
+        self.proxy_ok_code = True  # stand-ins allowed as far as the python edits go
+        self.pre = []  # data readers run first; their failures say nothing about the code edit
+        self.evidence = []  # data readers the code edit also reaches: rerun on the old data files
 
     def add(self, ts, why):
         before = len(self.cands)
-        self.cands |= set(ts)
+        ts = set(ts)
+        self.cands |= ts
+        (self.data_tests if self.mode == "data" else self.code_cands).update(ts)
         if DEBUG:
             self.reasons.append(f"{why}:+{len(self.cands) - before}")
 
@@ -900,6 +909,7 @@ def analyse_commit(cid, text, mp, tests):
         if rel is None:
             continue
         an.job_files += 1
+        an.mode = "code" if rel.endswith(".py") else "data"
         if fd["binary"]:
             an.add(mp["opens"].get(rel, ()), "binary-open")
             an.add(mp["files"].get(rel, ()), "binary-file")
@@ -933,6 +943,7 @@ def analyse_commit(cid, text, mp, tests):
 
         if rel.endswith(".py") and rel.startswith("tests/"):
             an.proxy_ok = False
+            an.proxy_ok_code = False
         if rel.endswith(".py") and (rel.startswith("sqlglot/") or rel.startswith("tests/")):
             res = analyse_py(old_text, new_text if not fd["deleted"] else None)
             kind = res["kind"]
@@ -1187,6 +1198,7 @@ class _PatchedFinder(importlib.abc.MetaPathFinder):
         return None
 
 
+_EVID = [False]  # child: results now are evidence only (reported as -1 - number)
 _JOBF = {}  # test number -> jobs (submit indices) to run; the others return None
 _CUR = [None]  # test number running in this child
 
@@ -1477,6 +1489,8 @@ def child_main(an, run_ids, tests, wfd):
     out = os.fdopen(wfd, "w", buffering=1)
 
     def emit(num, ok):
+        if _EVID[0]:
+            num = -1 - num  # evidence-only result
         out.write(json.dumps([num, ok]) + "\n")
 
     try:
@@ -1501,7 +1515,8 @@ def child_main(an, run_ids, tests, wfd):
 
     import unittest
 
-    groups = _group_ids(run_ids, tests)
+    pre_set = set(an.pre)
+    groups = _group_ids([n for n in run_ids if n not in pre_set], tests)
 
     signal.signal(signal.SIGALRM, _alarm)
 
@@ -1562,6 +1577,17 @@ def child_main(an, run_ids, tests, wfd):
     failed = [False]
     deferred_done = [False]
     _JOBF.update(an.job_filter)
+    if pre_set:
+        sof = an.stop_on_fail
+        an.stop_on_fail = False  # every data reader reports; none ends the run
+        run_groups(_group_ids([n for n in run_ids if n in pre_set], tests), R, tests, an, emit, [False])
+        if an.evidence:
+            _REDIRECT["off"] = True
+            _EVID[0] = True
+            run_groups(_group_ids(an.evidence, tests), R, tests, an, emit, [False])
+            _EVID[0] = False
+            _REDIRECT["off"] = False
+        an.stop_on_fail = sof
     run_groups(groups, R, tests, an, emit, failed)
     if failed[0] and an.deferred:
         deferred_done[0] = True
@@ -1785,6 +1811,14 @@ def main():
                     for r in {fd["old"], fd["new"]} - {None}
                 )
             )
+            data_part = set()
+            if MULTI_SPLIT and an.data_tests and an.code_cands and an.proxy_ok_code and not an.unknown and not an.filter_fixtures:
+                # code + data files: the code edit's costly tests may be stood in for as usual;
+                # tests reading a changed data file never are (they run or are selected)
+                data_part = set(an.data_tests)
+                cands = an.cands - data_part
+                heavy = {n for n in cands if tests[n]["seconds"] > RUN_MAX}
+                an.proxy_ok = True
             if heavy and PROXY and an.proxy_ok and not an.full_reload and not an.unknown:
                 # trust the cheap tests of the same code as a proxy for the long ones
                 rest = cands - heavy
@@ -1830,6 +1864,18 @@ def main():
                     blind = set()
                     run = sorted(run, key=lambda n: cpu_of(n, tests))
                     an.stop_on_fail = True
+            if data_part:
+                d_only = data_part - an.code_cands
+                r1, b1 = choose_runs(d_only, tests)
+                r2, b2 = choose_runs(data_part & an.code_cands, tests)
+                an.pre = sorted(set(r1) | set(r2), key=lambda n: cpu_of(n, tests))
+                # a reader the code edit also reaches is the code edit's evidence only when it
+                # fails on the unchanged data files (the patched ones may be why it fails)
+                an.evidence = sorted(r2, key=lambda n: cpu_of(n, tests)) if an.stop_on_fail else []
+                main_run = [n for n in run if n not in data_part]
+                run = an.pre + main_run
+                blind = (set(blind) - data_part) | b1 | b2
+                an.proxy_heavy -= data_part
             run, blind = apply_job_filter(an, run, blind, tests)
             plans.append((an, run, blind))
             if DEBUG:
@@ -1937,10 +1983,14 @@ def run_plans(plans, tests, results):
         import shutil
 
         shutil.rmtree(os.path.join(os.environ.get("TMPDIR", "/tmp"), "br%d" % st["pid"]), ignore_errors=True)
+        ev_bad = False
         for line in st["buf"].split(b"\n"):
             if line.strip():
                 try:
                     n, ok = json.loads(line)
+                    if n < 0:
+                        ev_bad = ev_bad or not ok
+                        continue
                     st["done"][n] = st["done"].get(n, True) and ok
                 except ValueError:
                     pass
@@ -1948,7 +1998,9 @@ def run_plans(plans, tests, results):
         for n in st["run"]:
             if not st["done"].get(n, False):  # failed, or never reported
                 sel.add(n)
-        if st["an"].proxy_heavy and (sel - set(st["blind"]) or killed or status):
+        pre = set(st["an"].pre)
+        bad_main = {n for n in st["run"] if n not in pre and not st["done"].get(n, False)}
+        if st["an"].proxy_heavy and (bad_main or ev_bad or killed or status):
             # a deferred test that ran (on its job subset) and passed is not needed
             sel |= {n for n in st["an"].proxy_heavy if not st["done"].get(n, False)}
         results[st["an"].cid] = sel
