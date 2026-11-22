@@ -41,6 +41,8 @@ PROXY = os.environ.get("BR_PROXY", "1") == "1"
 PROXY_BUDGET = float(os.environ.get("BR_PROXY_BUDGET", "1.5"))
 PROXY_ALL = int(os.environ.get("BR_PROXY_ALL", "2"))  # 1: code edits, 2: also re-import cases
 PROXY_MIN = int(os.environ.get("BR_PROXY_MIN", "3"))
+FIXTURE_FILTER = os.environ.get("BR_FIXTURE_FILTER", "1") == "1"
+FILTER_CAP = float(os.environ.get("BR_FILTER_CAP", "4"))  # per-test seconds when fixtures are filtered
 WORKER_MS = 2000
 DEBUG = os.environ.get("BR_DEBUG") == "1"
 
@@ -744,6 +746,8 @@ def analyse_commit(cid, text, mp, tests):
             an.patched[os.path.join(REPO, old_rel)] = None
 
         for r in {old_rel, new_rel} - {None}:
+            if r.startswith("tests/") and r.endswith(".py"):
+                continue  # test modules are "opened" by their own collection; the AST diff below decides
             an.add(mp["opens"].get(r, ()), "opened")
 
         if rel.endswith(".py") and rel.startswith("tests/"):
@@ -1152,6 +1156,53 @@ def _do_attr_surgery(an):
     return True
 
 
+_REDIRECT = {"off": False}
+
+
+def _install_fixture_filter(an):
+    """Fixture-only commit: the shared fixture loaders yield only the entries that differ from the
+    pinned file. Unchanged entries run unchanged code on unchanged data, as on the pinned commit."""
+    import collections
+
+    try:
+        helpers = importlib.import_module("tests.helpers")
+    except Exception:
+        return
+    changed = {os.path.abspath(p) for p, t in an.patched.items() if not p.endswith(".py") and t is not None}
+
+    def wrap(orig):
+        def loader(filename, *a, **kw):
+            path = os.path.abspath(os.path.join(helpers.FIXTURES_DIR, filename))
+            if path not in changed:
+                return  # an unchanged file: every entry runs exactly as on the pinned commit
+            _REDIRECT["off"] = True
+            try:
+                old = collections.Counter(repr(x) for x in orig(filename, *a, **kw))
+            finally:
+                _REDIRECT["off"] = False
+            for x in orig(filename, *a, **kw):
+                k = repr(x)
+                if old[k] > 0:
+                    old[k] -= 1
+                else:
+                    yield x
+
+        return loader
+
+    swaps = {}
+    for name in ("load_sql_fixture_pairs", "load_sql_fixtures"):
+        f = getattr(helpers, name, None)
+        if f is not None:
+            swaps[id(f)] = wrap(f)
+    for mname, mod in list(sys.modules.items()):
+        if mod is None or not (mname == "tests" or mname.startswith("tests.")):
+            continue
+        for attr in ("load_sql_fixture_pairs", "load_sql_fixtures"):
+            f = getattr(mod, attr, None)
+            if f is not None and id(f) in swaps:
+                setattr(mod, attr, swaps[id(f)])
+
+
 def _install_open_redirect(an):
     redirect = {}
     base = _child_tmp()
@@ -1173,6 +1224,8 @@ def _install_open_redirect(an):
     orig_os_open = os.open
 
     def fix(file):
+        if _REDIRECT["off"]:
+            return file
         if isinstance(file, (str, os.PathLike)):
             try:
                 p = os.path.abspath(os.fspath(file))
@@ -1214,6 +1267,8 @@ def child_main(an, run_ids, tests, wfd):
                     del sys.modules[name]
             importlib.invalidate_caches()
         _install_open_redirect(an)
+        if getattr(an, "filter_fixtures", False):
+            _install_fixture_filter(an)
     except BaseException as e:  # pragma: no cover
         log(an.cid, "child setup failed", repr(e))
         out.close()
@@ -1269,7 +1324,10 @@ def child_main(an, run_ids, tests, wfd):
             n = self.nums_by_test.get(id(test))
             if n is not None:
                 sec = tests[n]["seconds"]
-                signal.setitimer(signal.ITIMER_REAL, max(1.5, sec * 3 + 1.0))
+                lim = max(1.5, sec * 3 + 1.0)
+                if getattr(an, "filter_fixtures", False):
+                    lim = min(lim, FILTER_CAP)
+                signal.setitimer(signal.ITIMER_REAL, lim)
             super().startTest(test)
 
         def stopTest(self, test):
@@ -1422,6 +1480,16 @@ def main():
             cands = an.cands
             heavy = {n for n in cands if tests[n]["seconds"] > RUN_MAX}
             an.proxy_heavy = set()
+            an.filter_fixtures = (
+                FIXTURE_FILTER
+                and cands
+                and not an.unknown
+                and all(
+                    r.startswith("tests/") and not r.endswith(".py") and not fd["binary"] and not fd["deleted"]
+                    for fd in an.files
+                    for r in {fd["old"], fd["new"]} - {None}
+                )
+            )
             if heavy and PROXY and an.proxy_ok and not an.full_reload and not an.unknown:
                 # trust the cheap tests of the same code as a proxy for the long ones
                 rest = cands - heavy
@@ -1443,6 +1511,9 @@ def main():
                     an.proxy_heavy = heavy
                 else:
                     run, blind = choose_runs(cands, tests)
+            elif an.filter_fixtures:
+                # only the changed fixture entries run, so every candidate is cheap to run
+                run, blind = sorted(cands, key=lambda n: cpu_of(n, tests)), set()
             else:
                 run, blind = choose_runs(cands, tests)
             if blind and PROXY_ALL and an.proxy_ok and not an.unknown and (PROXY_ALL >= 2 or not an.full_reload):
