@@ -48,8 +48,10 @@ PROXY_ALL = int(os.environ.get("BR_PROXY_ALL", "2"))  # 1: code edits, 2: also r
 PROXY_MIN = int(os.environ.get("BR_PROXY_MIN", "3"))
 PROXY_CHEAP = float(os.environ.get("BR_PROXY_CHEAP", "0.25"))  # CPU s: cheaper candidates always run
 FIXTURE_FILTER = os.environ.get("BR_FIXTURE_FILTER", "1") == "1"
-MULTI_SPLIT = os.environ.get("BR_MULTI_SPLIT", "1") == "1"
-NEW_MODULE = os.environ.get("BR_NEW_MODULE", "1") == "1"  # new modules: only importers and directory listers  # code + data commits: plan the code part on its own
+# code + data commits: plan the code part on its own. Off by default: on the practice board it
+# ran more tests (CPU +8 s) and changed no selection.
+MULTI_SPLIT = os.environ.get("BR_MULTI_SPLIT", "0") == "1"
+NEW_MODULE = os.environ.get("BR_NEW_MODULE", "1") == "1"  # new modules: only importers and directory listers
 FILTER_CAP = float(os.environ.get("BR_FILTER_CAP", "4"))  # per-test seconds when fixtures are filtered
 WORKER_MS = 2000
 DEBUG = os.environ.get("BR_DEBUG") == "1"
