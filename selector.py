@@ -39,6 +39,8 @@ RUN_MAX = float(os.environ.get("BR_RUN_MAX", "5.0"))  # run candidates up to thi
 PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
 PROXY = os.environ.get("BR_PROXY", "1") == "1"
 PROXY_BUDGET = float(os.environ.get("BR_PROXY_BUDGET", "1.5"))
+PROXY_ALL = int(os.environ.get("BR_PROXY_ALL", "2"))  # 1: code edits, 2: also re-import cases
+PROXY_MIN = int(os.environ.get("BR_PROXY_MIN", "3"))
 WORKER_MS = 2000
 DEBUG = os.environ.get("BR_DEBUG") == "1"
 
@@ -1443,6 +1445,21 @@ def main():
                     run, blind = choose_runs(cands, tests)
             else:
                 run, blind = choose_runs(cands, tests)
+            if blind and PROXY_ALL and an.proxy_ok and not an.unknown and (PROXY_ALL >= 2 or not an.full_reload):
+                # tests too costly to run here: the cheaper tests of the same edit stand in for them
+                run = list(run)
+                spent = sum(cpu_of(n, tests) for n in run)
+                extra = sorted((n for n in blind if tests[n]["seconds"] <= RUN_MAX), key=lambda n: cpu_of(n, tests))
+                for n in extra:
+                    if spent >= PROXY_BUDGET and len(run) >= PROXY_MIN:
+                        break
+                    run.append(n)
+                    spent += cpu_of(n, tests)
+                if len(run) >= PROXY_MIN or (run and len(run) == len([n for n in cands if tests[n]["seconds"] <= RUN_MAX])):
+                    an.proxy_heavy |= set(blind) - set(run)
+                    blind = set()
+                    run = sorted(run, key=lambda n: cpu_of(n, tests))
+                    an.stop_on_fail = True
             plans.append((an, run, blind))
             if DEBUG:
                 log(cid, f"cands={len(cands)} run={len(run)} blind={len(blind)} reload={an.full_reload}", [r for r in an.reasons if not r.endswith(":+0")])
