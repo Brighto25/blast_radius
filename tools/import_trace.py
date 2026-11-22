@@ -37,7 +37,17 @@ if os.environ.get("TRACE_ALL"):
     mon.register_callback(4, mon.events.PY_START, cb)
     mon.set_events(4, mon.events.PY_START)
     sys.path.insert(0, os.getcwd())
+    import pkgutil
+
     import sqlglot  # noqa
+
+    for info in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+        try:
+            __import__(info.name)
+        except Exception as e:
+            print("lib import failed", info.name, e, file=sys.stderr)
+    json.dump(sorted(keys), open(os.path.join(out_dir, "lib_import_trace.json"), "w"))
+    mon.restart_events()
 
     for m in mods:
         try:

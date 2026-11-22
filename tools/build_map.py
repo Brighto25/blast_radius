@@ -6,6 +6,7 @@ Everything here is derived from running sqlglot's own tests at the pinned commit
 (coverage/import/fixture maps), never from the sample patches or answers.
 """
 
+import dis
 import gzip
 import json
 import os
@@ -15,8 +16,10 @@ from collections import defaultdict
 
 
 def unit_of(key):
-    # "sqlglot/x.py::Qual.name::123" -> "sqlglot/x.py::Qual.name"
-    f, q, _ = key.rsplit("::", 2)
+    # "sqlglot/x.py::Qual.name::123" -> "sqlglot/x.py::Qual.name"; lambdas keep their line
+    f, q, ln = key.rsplit("::", 2)
+    if q.endswith("<lambda>"):
+        return f + "::" + q + "@" + ln
     return f + "::" + q
 
 
@@ -31,8 +34,13 @@ def main():
     outcomes = {}
     lines = defaultdict(set)
     spawns = set()
+    flag_hits = defaultdict(set)  # "file:line" -> test idx
     for fn in os.listdir(mapout):
         d = json.load(open(os.path.join(mapout, fn)))
+        for nid, ks in d.get("flag_hits", {}).items():
+            if nid in idx:
+                for k in ks:
+                    flag_hits[k].add(idx[nid])
         spawns.update(n for n in d.get("spawns", ()) if n in idx)
         for n, ls in d.get("lines", {}).items():
             lines[n].update(ls)
@@ -84,6 +92,19 @@ def main():
         for p in ps:
             open_tests[p].add(i)
 
+    # library import-time units (values derived while importing sqlglot itself)
+    lib_imp = set()
+    lib_path = os.path.join(os.path.dirname(import_trace), "lib_import_trace.json")
+    if os.path.exists(lib_path):
+        lib_imp = {unit_of(k) for k in json.load(open(lib_path))}
+    # units run while importing a test module -> that module's tests
+    collect_units = defaultdict(set)
+    for c, ks in code.items():
+        kind, _, nid = c.partition("|")
+        if kind == "collect" and nid.endswith(".py"):
+            for k in ks:
+                collect_units[unit_of(k)].add(nid)
+
     # import-time units: from pytest collection plus a full eager import trace
     imp = {unit_of(k) for k in import_keys}
     if os.path.exists(import_trace):
@@ -106,13 +127,16 @@ def main():
             while stack:
                 co = stack.pop()
                 u = rel + "::" + co.co_qualname
-                for n in co.co_names:
-                    names[n].add(u)
+                if co.co_qualname.endswith("<lambda>"):
+                    u += "@%d" % co.co_firstlineno
+                # loads only: a store in another class body is an override, not a read
+                for ins in dis.get_instructions(co):
+                    if ins.opname.startswith("LOAD_") and ins.opname != "LOAD_FAST" and isinstance(ins.argval, str):
+                        if ins.argval.isidentifier() and len(ins.argval) < 60:
+                            names[ins.argval].add(u)
                 for cst in co.co_consts:
                     if isinstance(cst, types.CodeType):
                         stack.append(cst)
-                    elif isinstance(cst, str) and cst.isidentifier() and len(cst) < 60:
-                        names[cst].add(u)
 
     # sqlglot file -> sqlglot files that import it (for dialect subclassing)
     import ast as _ast
@@ -188,6 +212,10 @@ def main():
         "ids": ids,
         "cpu": cpu_est,
         "spawn_tests": sorted(idx[n] for n in spawns),
+        "lib_import_units": sorted(lib_imp),
+        "flag_hits": {k: sorted(v) for k, v in flag_hits.items()},
+        "flag_lines": json.load(open(os.path.expanduser("~/br/flag_lines.json"))) if os.path.exists(os.path.expanduser("~/br/flag_lines.json")) else {},
+        "collect_units": {u: sorted(ms) for u, ms in collect_units.items()},
         "file_importers": {f: sorted(s) for f, s in file_importers.items()},
         "heavy_lines": heavy_lines,
         "heavy_setup_units": heavy_setup_units,

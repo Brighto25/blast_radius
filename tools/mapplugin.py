@@ -84,8 +84,25 @@ _lines = {}  # nodeid -> set("file:line")
 _line_target = [None]
 
 
+FLAGL = set()
+if os.environ.get("FLAG_LINES"):
+    FLAGL = set(json.load(open(os.environ["FLAG_LINES"])))
+_flag_hits = {}  # nodeid -> set("file:line")
+
+
 def _on_line(code, line):
     tgt = _line_target[0]
+    if tgt is None and FLAGL:
+        f = code.co_filename
+        if not os.path.isabs(f):
+            f = os.path.abspath(f)
+        if f.startswith(WATCH):
+            k = f"{f[len(ROOT):]}:{line}"
+            if k in FLAGL:
+                kind, _, nid = _ctx[0].partition("|")
+                if nid:
+                    _flag_hits.setdefault(nid, set()).add(k)
+        return mon.DISABLE
     if tgt is not None:
         f = code.co_filename
         if not os.path.isabs(f):
@@ -104,7 +121,10 @@ def _set(ctx):
     if nid in HEAVY and kind in ("setup", "call", "teardown"):
         _line_target[0] = _lines.setdefault(nid, set())
         mon.set_events(TOOL, mon.events.PY_START | mon.events.LINE)
-    elif _line_target[0] is not None:
+    elif FLAGL and kind in ("setup", "call", "teardown"):
+        _line_target[0] = None
+        mon.set_events(TOOL, mon.events.PY_START | mon.events.LINE)
+    else:
         _line_target[0] = None
         mon.set_events(TOOL, mon.events.PY_START)
     mon.restart_events()
@@ -213,6 +233,7 @@ def pytest_sessionfinish(session):
                 "outcomes": _outcomes,
                 "lines": {n: sorted(s) for n, s in _lines.items()},
                 "spawns": sorted(_spawns),
+                "flag_hits": {n: sorted(v) for n, v in _flag_hits.items()},
             },
             f,
         )

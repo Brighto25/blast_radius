@@ -294,6 +294,8 @@ def analyse_py(old_src, new_src):
     old_scopes = dict(_stmt_lists(so))
     new_scopes = dict(_stmt_lists(sn))
     old_full = dict(_stmt_lists(old_tree))
+    attr_changes = []
+    classified = True
     for scope in set(old_scopes) | set(new_scopes):
         a = old_scopes.get(scope, [])
         b = new_scopes.get(scope, [])
@@ -307,6 +309,22 @@ def analyse_py(old_src, new_src):
                 continue
             olds = a[i1:i2]
             news = b[j1:j2]
+            pairs = list(zip(olds, news)) if tag == "replace" and len(olds) == len(news) else None
+            if pairs is None:
+                classified = False
+            else:
+                inner_only = True
+                for o, n in pairs:
+                    if isinstance(o, ast.ClassDef) and isinstance(n, ast.ClassDef) and o.name == n.name and _class_header(o) == _class_header(n):
+                        continue  # only its body differs: handled in the class's own scope
+                    inner_only = False
+                    ch = _attr_change(scope.rstrip("."), o, n)
+                    if ch is None:
+                        classified = False
+                    else:
+                        attr_changes.append(ch)
+                if inner_only:
+                    continue
             for s in olds + news:
                 names |= _targets(s)
                 if scope:
@@ -323,7 +341,73 @@ def analyse_py(old_src, new_src):
                 for n in ast.walk(s):
                     if isinstance(n, ast.Lambda):
                         lambda_lines.add(n.lineno)
-    return {"kind": "struct", "funcs": changed, "names": names, "lambda_lines": lambda_lines, "scopes": scopes}
+    return {
+        "kind": "struct",
+        "funcs": changed,
+        "names": names,
+        "lambda_lines": lambda_lines,
+        "scopes": scopes,
+        "attr_changes": attr_changes if classified else None,
+    }
+
+
+def _class_header(c):
+    return ast.dump(ast.ClassDef(name=c.name, bases=c.bases, keywords=c.keywords, body=[], decorator_list=c.decorator_list, type_params=[]))
+
+
+def _assign_parts(s):
+    if isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name):
+        return s.targets[0].id, s.value, None
+    if isinstance(s, ast.AnnAssign) and isinstance(s.target, ast.Name) and s.value is not None:
+        return s.target.id, s.value, ast.dump(s.annotation)
+    return None
+
+
+def _attr_change(scope, o, n):
+    """Classify a changed class/module attribute assignment, or None."""
+    po, pn = _assign_parts(o), _assign_parts(n)
+    if po is None or pn is None or po[0] != pn[0] or po[2] != pn[2]:
+        return None
+    name, ov, nv = po[0], po[1], pn[1]
+    if isinstance(ov, ast.Dict) and isinstance(nv, ast.Dict):
+        oe = {ast.dump(k) if k is not None else "**" + ast.dump(v): (k, v) for k, v in zip(ov.keys, ov.values)}
+        ne = {ast.dump(k) if k is not None else "**" + ast.dump(v): (k, v) for k, v in zip(nv.keys, nv.values)}
+        keys, lambda_lines, classkeys, valstrs = set(), set(), set(), set()
+        for kd in set(oe) | set(ne):
+            a, b = oe.get(kd), ne.get(kd)
+            if a is not None and b is not None and ast.dump(a[1]) == ast.dump(b[1]):
+                continue
+            for ent in (a, b):
+                if ent is None:
+                    continue
+                k = ent[0]
+                if isinstance(k, ast.Constant) and isinstance(k.value, str) and k.value.strip():
+                    keys.add(k.value)
+                elif isinstance(k, ast.Attribute) and isinstance(k.value, ast.Name) and k.value.id == "exp":
+                    classkeys.add(k.attr)
+                else:
+                    return None  # spreads or computed keys: no handle
+                for x in ast.walk(ent[1]):
+                    if isinstance(x, ast.Constant) and isinstance(x.value, str) and len(x.value.strip()) >= 3:
+                        valstrs.add(x.value.strip())
+            if a is not None:
+                for x in ast.walk(a[1]):
+                    if isinstance(x, ast.Lambda):
+                        lambda_lines.add(x.lineno)
+        if classkeys and not valstrs and not lambda_lines:
+            pass  # value is a plain reference: class-key readers decide
+        return {
+            "kind": "dict",
+            "scope": scope,
+            "target": name,
+            "keys": sorted(keys),
+            "classkeys": sorted(classkeys),
+            "valstrs": sorted(valstrs - keys),
+            "lambda_lines": sorted(lambda_lines),
+        }
+    if isinstance(ov, (ast.Dict, ast.Lambda)) or isinstance(nv, (ast.Dict, ast.Lambda)):
+        return None
+    return {"kind": "scalar", "scope": scope, "target": name, "value": ast.unparse(nv)}
 
 
 def _stmt_ranges(tree):
@@ -402,6 +486,7 @@ class Analysis:
         self.unknown = False
         self.proxy_ok = True
         self.stop_on_fail = False
+        self.attr_surgery = []
         self.proxy_heavy = set()
 
     def add(self, ts, why):
@@ -455,6 +540,170 @@ def dialect_family(mp, f):
                     seen.add(sib)
                     frontier.append(sib)
     return seen
+
+
+_TEST_AST = {}
+_FIXTURE_TEXT = None
+
+
+def tests_mentioning(mp, tests, keys):
+    """Tests whose own source (or a fixture they read) mentions any key (case-insensitive)."""
+    global _FIXTURE_TEXT
+    pats = [re.compile(r"\s+".join(re.escape(w) for w in k.split()), re.I) for k in keys if k.strip()]
+    out = set()
+    if not pats:
+        return out
+    for tf, src in mp["test_sources"].items():
+        if not any(p.search(src) for p in pats):
+            continue
+        tree = _TEST_AST.get(tf)
+        if tree is None:
+            tree = _TEST_AST[tf] = ast.parse(src)
+        lines = src.split("\n")
+        covered = []
+        for cls in tree.body:
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            for fn in cls.body:
+                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    seg = "\n".join(lines[fn.lineno - 1 : fn.end_lineno])
+                    covered.append((fn.lineno, fn.end_lineno))
+                    if any(p.search(seg) for p in pats):
+                        tid = f"{tf}::{cls.name}::{fn.name}"
+                        for i in mp["tests_by_file"].get(tf, ()):
+                            if tests[i]["id"] == tid:
+                                out.add(i)
+        # mentioned outside test methods (helpers, module constants): the whole file
+        mask = set()
+        for lo, hi in covered:
+            mask.update(range(lo, hi + 1))
+        rest = "\n".join(l for i, l in enumerate(lines, 1) if i not in mask)
+        if any(p.search(rest) for p in pats):
+            out.update(mp["tests_by_file"].get(tf, ()))
+    if _FIXTURE_TEXT is None:
+        _FIXTURE_TEXT = {}
+        for rel in mp["opens"]:
+            if rel.startswith("tests/") and not rel.endswith((".py", ".pyc")) and "__pycache__" not in rel:
+                try:
+                    with open(os.path.join(REPO, rel), encoding="utf-8", errors="replace") as fh:
+                        _FIXTURE_TEXT[rel] = fh.read()
+                except OSError:
+                    pass
+    for rel, txt in _FIXTURE_TEXT.items():
+        if any(p.search(txt) for p in pats):
+            out |= mp["opens"].get(rel, set())
+    return out
+
+
+_CLASS_QUALS = {}
+
+
+def _class_body_quals(mp, f):
+    """qualnames of class bodies in file f (code units whose qualname is a class)."""
+    q = _CLASS_QUALS.get(f)
+    if q is None:
+        try:
+            tree = ast.parse(open(os.path.join(REPO, f), encoding="utf-8").read())
+        except (OSError, SyntaxError):
+            tree = ast.parse("")
+        q = set()
+
+        def walk(node, prefix):
+            for ch in ast.iter_child_nodes(node):
+                if isinstance(ch, ast.ClassDef):
+                    q.add(prefix + ch.name)
+                    walk(ch, prefix + ch.name + ".")
+                elif isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    walk(ch, prefix + ch.name + ".<locals>.")
+                else:
+                    walk(ch, prefix)
+
+        walk(tree, "")
+        _CLASS_QUALS[f] = q
+    return q
+
+
+def precise_attr_changes(an, mp, tests, f, changes, res):
+    """Candidates for edited flags/constants and string-keyed dict entries. False -> fall back."""
+    fam = dialect_family(mp, f)
+    fam_tests = set()
+    for g in fam:
+        fam_tests |= mp["files"].get(g, set())
+    cands = set()
+    surgery = []
+    reload_needed = False
+    for ch in changes:
+        if ch["kind"] == "scalar":
+            readers = [u for u in mp["names"].get(ch["target"], ()) if u != f + "::" + ch["scope"]]
+            for u in readers:
+                uf, uq = u.split("::", 1)
+                if uq == "<module>" or (uf.startswith("sqlglot/") and uq in _class_body_quals(mp, uf)):
+                    return False  # read by class/module bodies: derived values elsewhere
+                if u in mp["lib_import_units"]:
+                    reload_needed = True  # a function also run while importing: re-import
+                if mp["collect_units"].get(u):  # read while importing a test module: re-import
+                    reload_needed = True
+            line_files = set()
+            for k, nm in mp["flag_lines"].items():
+                if ch["target"] in nm:
+                    kf, _, kl = k.rpartition(":")
+                    line_files.add(kf)
+                    ts = set(mp["flag_hits"].get(k, ()))
+                    for t, hl in mp["heavy_lines"].items():
+                        if int(kl) in hl.get(kf, ()):
+                            ts.add(t)
+                    if fam and len(ts) > HOT and kf not in fam:
+                        ts &= fam_tests
+                    cands |= ts
+            for u in readers:
+                uf, uq = u.split("::", 1)
+                if uf in line_files:
+                    continue  # the exact reading lines decided it
+                ts = tests_of_unit_prefix(mp, uf, uq)
+                if fam and len(ts) > HOT and uf not in fam:
+                    ts = ts & fam_tests
+                cands |= ts
+            if ch["scope"]:
+                surgery.append((f, ch["scope"], ch["target"], ch["value"]))
+            else:
+                reload_needed = True
+        else:  # dict entries keyed by SQL text or expression class
+            reload_needed = True
+            for cls_name in ch.get("classkeys", ()):
+                ts = set()
+                for u in mp["names"].get(cls_name, ()):
+                    uf, uq = u.split("::", 1)
+                    if uq == "<module>" or u in mp["lib_import_units"]:
+                        continue
+                    ts |= tests_of_unit_prefix(mp, uf, uq)
+                for uf, ub in mp["unit_index"].items():
+                    for q, t2 in ub.items():
+                        if q == cls_name or q.startswith(cls_name + "."):
+                            ts |= t2
+                if fam:
+                    ts &= fam_tests
+                cands |= ts
+            if ch.get("valstrs"):
+                vm = tests_mentioning(mp, tests, ch["valstrs"])
+                if fam and len(vm) > HOT:
+                    vm &= fam_tests
+                cands |= vm
+            for ln in ch["lambda_lines"]:
+                for q, ts in mp["unit_index"].get(f, {}).items():
+                    if q.endswith("<lambda>@%d" % ln):
+                        cands |= ts
+            ment = tests_mentioning(mp, tests, ch["keys"])
+            if fam and len(ment) > HOT:
+                ment = ment & fam_tests
+            cands |= ment
+    an.add(cands, "attr:" + ",".join(c["target"] for c in changes))
+    if f.startswith("sqlglot/"):
+        an.add(mp["spawn_tests"], "spawn")
+    if reload_needed:
+        an.full_reload = True
+    else:
+        an.attr_surgery.extend(surgery)
+    return True
 
 
 def analyse_commit(cid, text, mp, tests):
@@ -538,6 +787,11 @@ def analyse_commit(cid, text, mp, tests):
                     ):
                         an.full_reload = True
                 continue
+            # class/module attribute edits we can localise precisely
+            ac = res.get("attr_changes")
+            if kind == "struct" and ac and old_rel == new_rel and not fd["new_file"] and not fd["deleted"]:
+                if precise_attr_changes(an, mp, tests, f, ac, res):
+                    continue
             # structural, syntax error, add/delete/rename
             an.full_reload = True
             scopes = res.get("scopes")
@@ -656,6 +910,10 @@ def load_map(tests):
         "test_sources": test_sources,
         "module_importers": module_importers,
         "spawn_tests": conv(raw.get("spawn_tests", [])),
+        "lib_import_units": set(raw.get("lib_import_units", [])),
+        "flag_lines": raw.get("flag_lines", {}),
+        "flag_hits": {k: conv(v) for k, v in raw.get("flag_hits", {}).items()},
+        "collect_units": raw.get("collect_units", {}),
         "cpu": {remap[int(i)]: v for i, v in raw.get("cpu", {}).items() if remap[int(i)] is not None},
         "file_importers": raw.get("file_importers", {}),
         "heavy_lines": {
@@ -874,6 +1132,24 @@ def _do_surgery(an):
     return True
 
 
+def _do_attr_surgery(an):
+    for rel, scope, name, value in an.attr_surgery:
+        mod = sys.modules.get(_module_name(rel))
+        if mod is None:
+            continue  # not imported yet: the finder serves the patched source
+        obj = mod
+        for part in scope.split("."):
+            obj = getattr(obj, "__dict__", {}).get(part)
+            if obj is None:
+                return False
+        try:
+            val = eval(compile(value, rel, "eval"), mod.__dict__, dict(vars(obj)))
+            setattr(obj, name, val)
+        except Exception:
+            return False
+    return True
+
+
 def _install_open_redirect(an):
     redirect = {}
     base = _child_tmp()
@@ -929,7 +1205,7 @@ def child_main(an, run_ids, tests, wfd):
         if pyfiles:
             sys.meta_path.insert(0, _PatchedFinder(pyfiles))
             _install_subprocess_overlay(pyfiles)
-        reload_all = an.full_reload or not _do_surgery(an)
+        reload_all = an.full_reload or not _do_surgery(an) or not _do_attr_surgery(an)
         if reload_all:
             for name in list(sys.modules):
                 if name in ("sqlglot", "tests") or name.startswith("sqlglot.") or name.startswith("tests."):
