@@ -45,7 +45,7 @@ SCALED = os.environ.get("BR_SCALED", "1") == "1"
 # optimize, plan, duckdb transpile of every 4th TPC-DS query) matches the unpatched code exactly
 STANDIN = os.environ.get("BR_STANDIN", "1") == "1"
 GAMBLE = os.environ.get("BR_GAMBLE", "1") == "1"
-GAMBLE_S = float(os.environ.get("BR_GAMBLE_S", "3.0"))
+GAMBLE_S = float(os.environ.get("BR_GAMBLE_S", "1.0"))
 _STANDIN_KEY = 10**9
 _TPC_REF = [None]
 JOB_SETUP = float(os.environ.get("BR_JOB_SETUP", "2.5"))  # class setup + building every job's arguments
