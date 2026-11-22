@@ -210,16 +210,34 @@ def _stmt_lists(tree):
     """(scope, [stmts]) for the module and each class body (function bodies stripped)."""
     res = []
 
-    def walk(stmts, scope):
-        res.append((scope, stmts))
+    def collect(stmts, scope, flat):
+        # statements inside if/try/with blocks belong to the same scope: flatten them, and keep
+        # each block's header (its test, handlers' types...) as a statement of its own
         for s in stmts:
-            if isinstance(s, ast.ClassDef):
-                walk(s.body, scope + s.name + ".")
-            elif isinstance(s, (ast.If, ast.Try, ast.With)):
+            if isinstance(s, (ast.If, ast.Try, ast.With)):
+                head = copy.copy(s)
+                for field in ("body", "orelse", "finalbody"):
+                    if hasattr(head, field):
+                        setattr(head, field, [])
+                if isinstance(s, ast.Try):
+                    head.handlers = [ast.ExceptHandler(type=h.type, name=h.name, body=[]) for h in s.handlers]
+                flat.append(head)
                 for field in ("body", "orelse", "finalbody"):
                     sub = getattr(s, field, None)
                     if sub:
-                        walk(sub, scope)
+                        collect(sub, scope, flat)
+                if isinstance(s, ast.Try):
+                    for h in s.handlers:
+                        collect(h.body, scope, flat)
+            else:
+                flat.append(s)
+                if isinstance(s, ast.ClassDef):
+                    walk(s.body, scope + s.name + ".")
+
+    def walk(stmts, scope):
+        flat = []
+        res.append((scope, flat))
+        collect(stmts, scope, flat)
 
     walk(tree.body, "")
     return res
@@ -259,6 +277,19 @@ def _targets(node):
     return t
 
 
+def _strip_docstrings(tree):
+    """Copy of tree with every module/class/function docstring removed."""
+    import copy
+
+    t = copy.deepcopy(tree)
+    for node in ast.walk(t):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            b = node.body
+            if b and isinstance(b[0], ast.Expr) and isinstance(getattr(b[0], "value", None), ast.Constant) and isinstance(b[0].value.value, str):
+                node.body = b[1:]
+    return t
+
+
 def analyse_py(old_src, new_src):
     """Returns dict: kind in {'same','body','struct','syntax'}, funcs, names, lambda_lines."""
     try:
@@ -272,6 +303,8 @@ def analyse_py(old_src, new_src):
 
     if ast.dump(old_tree) == ast.dump(new_tree):
         return {"kind": "same", "funcs": set(), "names": set(), "lambda_lines": set()}
+    if ast.dump(_strip_docstrings(old_tree)) == ast.dump(_strip_docstrings(new_tree)):
+        return {"kind": "doc", "funcs": set(), "names": set(), "lambda_lines": set()}
 
     od = _outer_defs(old_tree)
     nd = _outer_defs(new_tree)
@@ -314,7 +347,14 @@ def analyse_py(old_src, new_src):
             olds = a[i1:i2]
             news = b[j1:j2]
             pairs = list(zip(olds, news)) if tag == "replace" and len(olds) == len(news) else None
-            if pairs is None:
+            if tag in ("insert", "delete"):
+                for st in olds + news:
+                    ch = _add_change(scope.rstrip("."), st)
+                    if ch is None:
+                        classified = False
+                    else:
+                        attr_changes.append(ch)
+            elif pairs is None:
                 classified = False
             else:
                 inner_only = True
@@ -353,6 +393,28 @@ def analyse_py(old_src, new_src):
         "scopes": scopes,
         "attr_changes": attr_changes if classified else None,
     }
+
+
+def _add_change(scope, s):
+    """A definition added or removed whole: the names it binds. None if it may have side effects."""
+    if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if s.decorator_list or (isinstance(s, ast.ClassDef) and (s.bases or s.keywords)):
+            return None  # decorators / subclass hooks run at definition time
+        names = {s.name}
+    elif isinstance(s, ast.Assign) and all(isinstance(t, ast.Name) for t in s.targets):
+        if any(isinstance(n, ast.Call) for n in ast.walk(s.value)):
+            return None
+        names = {t.id for t in s.targets}
+    elif isinstance(s, ast.AnnAssign) and isinstance(s.target, ast.Name):
+        names = {s.target.id}
+    elif isinstance(s, (ast.Import, ast.ImportFrom)):
+        mod = getattr(s, "module", None) or ""
+        if getattr(s, "level", 0) or mod.startswith("sqlglot") or any(a.name.startswith("sqlglot") for a in s.names):
+            return None  # importing package modules can register dialects etc.
+        names = {(a.asname or a.name).split(".")[0] for a in s.names}
+    else:
+        return None
+    return {"kind": "add", "scope": scope, "targets": sorted(names)}
 
 
 def _class_header(c):
@@ -671,6 +733,22 @@ def precise_attr_changes(an, mp, tests, f, changes, res):
                 surgery.append((f, ch["scope"], ch["target"], ch["value"]))
             else:
                 reload_needed = True
+        elif ch["kind"] == "add":
+            # a name defined or removed whole: only code reading that name (or tests naming it) can notice
+            reload_needed = True
+            for nm in ch["targets"]:
+                for u in mp["names"].get(nm, ()):
+                    uf, uq = u.split("::", 1)
+                    if uq == "<module>" or (uf.startswith("sqlglot/") and uq in _class_body_quals(mp, uf)):
+                        return False
+                    ts = tests_of_unit_prefix(mp, uf, uq)
+                    if fam and len(ts) > HOT and uf not in fam:
+                        ts = ts & fam_tests
+                    cands |= ts
+                ment = tests_mentioning(mp, tests, [nm]) if len(nm) > 2 else set()
+                if fam and len(ment) > HOT:
+                    ment &= fam_tests
+                cands |= ment
         else:  # dict entries keyed by SQL text or expression class
             reload_needed = True
             for cls_name in ch.get("classkeys", ()):
@@ -700,7 +778,7 @@ def precise_attr_changes(an, mp, tests, f, changes, res):
             if fam and len(ment) > HOT:
                 ment = ment & fam_tests
             cands |= ment
-    an.add(cands, "attr:" + ",".join(c["target"] for c in changes))
+    an.add(cands, "attr:" + ",".join(c.get("target") or "+".join(c.get("targets", ())) for c in changes))
     if f.startswith("sqlglot/"):
         an.add(mp["spawn_tests"], "spawn")
     if reload_needed:
@@ -757,6 +835,14 @@ def analyse_commit(cid, text, mp, tests):
             kind = res["kind"]
             if kind == "same" and old_rel == new_rel:
                 continue
+            if kind == "doc" and old_rel == new_rel and rel.startswith("sqlglot/"):
+                # only docstrings changed: they matter to doctests and to code reading __doc__
+                for tf in mp["test_sources"]:
+                    if "doctest" in mp["test_sources"][tf]:
+                        an.add(id_by_file.get(tf, ()), "doc-doctest")
+                an.add(tests_mentioning(mp, tests, ["__doc__"]), "doc-ref")
+                an.full_reload = True
+                continue
             f = old_rel or new_rel
             if kind == "body" and old_rel == new_rel:
                 probe = probe_lines(old_text, fd["hunks"])
@@ -797,6 +883,8 @@ def analyse_commit(cid, text, mp, tests):
             ac = res.get("attr_changes")
             if kind == "struct" and ac and old_rel == new_rel and not fd["new_file"] and not fd["deleted"]:
                 if precise_attr_changes(an, mp, tests, f, ac, res):
+                    for q in res["funcs"]:
+                        an.add(tests_of_unit_prefix(mp, f, q), f"struct-func:{q}")
                     continue
             # structural, syntax error, add/delete/rename
             an.full_reload = True
@@ -1652,7 +1740,7 @@ def run_plans(plans, tests, results):
             sel |= st["an"].proxy_heavy
         results[st["an"].cid] = sel
         if DEBUG or killed or status:
-            log(st["an"].cid, f"ran={len(st['done'])}/{len(st['run'])} sel={len(sel)} cpu={cpu:.2f} est={sum(tests[n]['seconds'] for n in st['run']):.2f} killed={killed} status={status}")
+            log(st["an"].cid, f"ran={len(st['done'])}/{len(st['run'])} sel={len(sel)} cpu={cpu:.2f} est={sum(tests[n]['seconds'] for n in st['run']):.2f} ecpu={sum(cpu_of(n, tests) for n in st['run']):.2f} killed={killed} status={status}")
 
     while queue or active:
         while queue and len(active) < PARALLEL:

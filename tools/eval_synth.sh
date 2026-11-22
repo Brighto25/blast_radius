@@ -2,8 +2,8 @@
 # Score the selector on the labeled synthetic commits (+ optional sample).
 set -u
 T="$(cd "$(dirname "$0")/.." && pwd)"
-S=${1:-/home/bright/br/synth}
-E=/home/bright/br/synth_eval
+S=${1:-/home/bright/br/synth}; E=${2:-/home/bright/br/synth_eval}
+
 rm -rf "$E" && mkdir -p "$E/commits"
 python3 - "$S" "$E" <<'EOF'
 import json, shutil, sys
