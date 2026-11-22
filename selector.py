@@ -48,7 +48,8 @@ PROXY_ALL = int(os.environ.get("BR_PROXY_ALL", "2"))  # 1: code edits, 2: also r
 PROXY_MIN = int(os.environ.get("BR_PROXY_MIN", "3"))
 PROXY_CHEAP = float(os.environ.get("BR_PROXY_CHEAP", "0.25"))  # CPU s: cheaper candidates always run
 FIXTURE_FILTER = os.environ.get("BR_FIXTURE_FILTER", "1") == "1"
-MULTI_SPLIT = os.environ.get("BR_MULTI_SPLIT", "1") == "1"  # code + data commits: plan the code part on its own
+MULTI_SPLIT = os.environ.get("BR_MULTI_SPLIT", "1") == "1"
+NEW_MODULE = os.environ.get("BR_NEW_MODULE", "1") == "1"  # new modules: only importers and directory listers  # code + data commits: plan the code part on its own
 FILTER_CAP = float(os.environ.get("BR_FILTER_CAP", "4"))  # per-test seconds when fixtures are filtered
 WORKER_MS = 2000
 DEBUG = os.environ.get("BR_DEBUG") == "1"
@@ -899,6 +900,53 @@ def precise_attr_changes(an, mp, tests, f, changes, res):
     return True
 
 
+_DISCOVERY_WORDS = ("pkgutil", "listdir", "iter_modules", "walk_packages", "scandir", "iterdir", "glob(")
+
+
+def _shadows(rel):
+    """Would a new module at rel take the place of one that exists (module vs package)?"""
+    base = os.path.join(REPO, rel)
+    if os.path.exists(base):
+        return True
+    if rel.endswith("/__init__.py"):
+        return os.path.exists(os.path.dirname(base) + ".py")
+    return os.path.isdir(base[:-3])
+
+
+_SOURCES = []
+
+
+def _named_anywhere(rel):
+    """Does existing code name this module, so it may import it once it exists
+    (an optional `try: import`, or a lazy-load list of module names)?"""
+    if not _SOURCES:
+        for top in ("sqlglot", "tests"):
+            for d, _, fs in os.walk(os.path.join(REPO, top)):
+                if "__pycache__" in d or "fixtures" in d:
+                    continue
+                for fn in fs:
+                    if fn.endswith(".py"):
+                        try:
+                            with open(os.path.join(d, fn), encoding="utf-8", errors="replace") as fh:
+                                _SOURCES.append(fh.read())
+                        except OSError:
+                            pass
+        _SOURCES.append("")
+    mod = rel[:-3]
+    if mod.endswith("/__init__"):
+        mod = mod[: -len("/__init__")]
+    short = mod.rsplit("/", 1)[-1]
+    w = r"(?<![\w])" + re.escape(short) + r"(?![\w])"
+    pat = re.compile(
+        r"(?:^|[\s.;])(?:import|from)\s+[\w.]*" + w
+        + r"|(?:^|[\s;])import\s+[\w., ]*" + w
+        + r"|['" + '"' + r"]" + re.escape(short) + r"['" + '"' + r"]"
+        + r"|['" + '"' + r"][\w.]*\." + re.escape(short) + r"['" + '"' + r"]",
+        re.M,
+    )
+    return any(pat.search(src) for src in _SOURCES)
+
+
 def analyse_commit(cid, text, mp, tests):
     an = Analysis(cid, parse_patch(text), tests, mp)
     id_by_file = mp["tests_by_file"]
@@ -949,6 +997,23 @@ def analyse_commit(cid, text, mp, tests):
             kind = res["kind"]
             if kind == "same" and old_rel == new_rel:
                 an.job_clean += 1
+                continue
+            if (
+                NEW_MODULE
+                and fd["new_file"]
+                and not fd["deleted"]
+                and kind != "syntax"
+                and rel.startswith("sqlglot/")
+                and old_rel in (None, new_rel)
+                and not _shadows(rel)
+                and not _named_anywhere(rel)
+            ):
+                # a brand-new module runs only if something imports it: a changed file
+                # (analysed on its own) or a test that lists a package directory
+                for tf, src in mp["test_sources"].items():
+                    if any(k in src for k in _DISCOVERY_WORDS):
+                        an.add(id_by_file.get(tf, ()), "new-module-discovery")
+                an.full_reload = True
                 continue
             if kind == "doc" and old_rel == new_rel and rel.startswith("sqlglot/"):
                 # only docstrings changed: they matter to doctests and to code reading __doc__
